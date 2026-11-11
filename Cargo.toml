@@ -1,0 +1,12 @@
+[package]
+name = "dvd_audio_grabber_v2"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.29"
+image = { version = "0.25", default-features = false, features = ["png"] }
+rfd = "0.15"
+
+[build-dependencies]
+winres = "0.1"
