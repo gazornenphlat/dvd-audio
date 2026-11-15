@@ -296,7 +296,8 @@ impl eframe::App for App {
                 egui::ScrollArea::vertical().id_salt("tracks").max_height(280.0).auto_shrink([false, false]).show(ui, |ui| {
                     for row in &mut self.rows {
                         let reason = dvd::unsupported_reason(&row.info, self.format);
-                        let label = row_label(row, reason.as_deref());
+                        let warning = dvd::track_warning(&row.info, self.format);
+                        let label = row_label(row, reason.as_deref(), warning.as_deref());
                         ui.add_enabled(reason.is_none(), egui::Checkbox::new(&mut row.selected, label));
                     }
                 });
@@ -422,7 +423,7 @@ fn window_icon() -> egui::IconData {
 }
 
 /// One line per track: what it is, and why it can't be ticked if it can't.
-fn row_label(row: &Row, reason: Option<&str>) -> String {
+fn row_label(row: &Row, reason: Option<&str>, warning: Option<&str>) -> String {
     let mut parts = vec![format!("Track {}", row.number), row.info.codec.name().to_string()];
     if let Some(rate) = row.info.sample_rate {
         parts.push(format!("{} kHz", dvd::khz(rate)));
@@ -436,6 +437,9 @@ fn row_label(row: &Row, reason: Option<&str>) -> String {
     parts.push(dvd::size_text(row.bytes));
     if let Some(reason) = reason {
         parts.push(format!("can't convert: {reason}"));
+    }
+    if let Some(warning) = warning {
+        parts.push(format!("warning: {warning}"));
     }
     if !row.found {
         parts.push("no audio found: maybe copy-protected".to_string());
