@@ -3,6 +3,10 @@ name = "dvd_audio_grabber_v2"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "dvd_audio_grabber_ifo"
+path = "src/main.rs"
+
 [dependencies]
 eframe = "0.29"
 image = { version = "0.25", default-features = false, features = ["png"] }
