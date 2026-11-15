@@ -214,6 +214,21 @@ pub fn unsupported_reason(info: &TrackInfo, format: Format) -> Option<String> {
     Some(text)
 }
 
+/// A warning for a track that can be saved but has a known problem, or None.
+/// 24-bit multichannel PCM has converted garbled on some discs (see the README's
+/// known limitations) and the cause is not yet found, so warn on the row instead
+/// of converting silently. Raw copies the bytes unchanged, so it needs no warning.
+pub fn track_warning(info: &TrackInfo, format: Format) -> Option<String> {
+    if format != Format::Raw
+        && info.codec == Codec::Lpcm
+        && info.bits == Some(24)
+        && info.channels.is_some_and(|c| c > 2)
+    {
+        return Some("24-bit multichannel PCM has converted garbled on some discs; check the result".to_string());
+    }
+    None
+}
+
 /// A sample rate in kHz as people write it: 48, 44.1, 96.
 pub fn khz(rate: u32) -> String {
     if rate % 1000 == 0 {
@@ -583,8 +598,10 @@ fn to_ffmpeg(raw: &Path, out: &Path, info: &TrackInfo, format: Format) -> Result
         Err(_) => Err(Error::Ffmpeg(FFMPEG_MISSING.into())),
         Ok(run) if run.status.success() => Ok(()),
         Ok(run) => {
-            let last = String::from_utf8_lossy(&run.stderr).lines().last().unwrap_or("ffmpeg failed").trim().to_string();
-            Err(Error::Ffmpeg(last))
+            // Keep the whole stderr, not just the last line: with `-loglevel error`
+            // it is short, and the real error is not always the final line.
+            let text = String::from_utf8_lossy(&run.stderr).trim().to_string();
+            Err(Error::Ffmpeg(if text.is_empty() { "ffmpeg failed".to_string() } else { text }))
         }
     }
 }
@@ -1536,6 +1553,93 @@ mod tests {
             let total: u64 = disc.tracks.iter().filter(|t| convertible(&t.info, format)).map(|t| t.bytes).sum();
             let report = extract(Path::new(&folder), &out, &wanted, format, "track{n}", total, &cancel, &mut |_| {}).unwrap();
             println!("{format:?}: saved {:?}, skipped {:?}, failed {:?}", report.saved, report.skipped, report.failed);
+        }
+    }
+
+    /// Isolation test for the garbled 24-bit multichannel PCM bug (see the README's
+    /// known limitations). Set DVD_AUDIO_TEST_FOLDER to an AUDIO_TS folder holding a
+    /// garbled track and run `cargo test -- --ignored --nocapture`.
+    ///
+    /// For each 24-bit, multichannel PCM track it saves the same track as Raw, WAV
+    /// and FLAC, then compares the WAV payload against the raw bytes with the
+    /// per-sample byte order undone:
+    /// - WAV payload matches the raw bytes: the native writer reproduces the
+    ///   demuxed stream, so the writer is innocent and the fault is upstream, in
+    ///   the demuxed bytes or in the simple-interleaving assumption both the WAV
+    ///   and ffmpeg paths share. Check the Raw file in an external tool that
+    ///   understands DVD-Audio PCM packing.
+    /// - WAV payload differs: the writer (or the demux feeding it) is implicated;
+    ///   the first differing byte offset is printed.
+    /// The FLAC file is saved for the same comparison by ear or with an external
+    /// decoder; this test does not decode it. The comparison is printed, never
+    /// asserted: this is a diagnostic, not a regression test, until the bug is
+    /// reproduced and understood.
+    #[test]
+    #[ignore]
+    fn isolates_24bit_multichannel_pcm_garble() {
+        let folder = std::env::var("DVD_AUDIO_TEST_FOLDER").expect("set DVD_AUDIO_TEST_FOLDER");
+        let cancel = AtomicBool::new(false);
+        let disc = scan(Path::new(&folder), &cancel).unwrap();
+        let targets: Vec<(usize, TrackInfo)> = disc
+            .tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| {
+                t.info.codec == Codec::Lpcm && t.info.bits == Some(24) && t.info.channels.is_some_and(|c| c > 2)
+            })
+            .map(|(i, t)| (i + 1, t.info.clone()))
+            .collect();
+        if targets.is_empty() {
+            println!("no 24-bit multichannel PCM tracks found on this disc");
+            return;
+        }
+        // Start clean so the output names below are the ones extract writes.
+        let out = std::env::temp_dir().join("dvd_audio_grabber_isolation");
+        fs::remove_dir_all(&out).ok();
+        for (number, info) in targets {
+            let wanted = vec![(number, info.key)];
+            let total = disc.tracks[number - 1].bytes;
+            let frame = info.channels.unwrap() as usize * 3; // 24-bit samples, one frame per channel set
+            for format in [Format::Raw, Format::Wav, Format::Flac] {
+                let dir = out.join(format!("track{number:02}_{format:?}"));
+                let report = extract(Path::new(&folder), &dir, &wanted, format, "track{n}", total, &cancel, &mut |_| {}).unwrap();
+                println!("track {number} {format:?}: saved {:?}, skipped {:?}, failed {:?}", report.saved, report.skipped, report.failed);
+            }
+            let raw_path = out.join(format!("track{number:02}_Raw")).join(format!("track{number:02}.pcm"));
+            let wav_path = out.join(format!("track{number:02}_Wav")).join(format!("track{number:02}.wav"));
+            if !raw_path.exists() || !wav_path.exists() {
+                println!("track {number}: Raw or WAV output missing, cannot compare");
+                continue;
+            }
+            let raw = fs::read(&raw_path).unwrap();
+            let wav = fs::read(&wav_path).unwrap();
+            // The native WAV writer stores a 44-byte header, then the same samples
+            // with each sample's bytes reversed (big-endian on disc, little-endian
+            // in WAV). Undo the reversal and compare with the raw copy.
+            let payload = &wav[44..];
+            let mut unswapped = payload.to_vec();
+            for sample in unswapped.chunks_exact_mut(3) {
+                sample.reverse();
+            }
+            // The writer drops a partial trailing frame, so compare only whole frames.
+            let len = raw.len().min(unswapped.len()) / frame * frame;
+            let first_diff = raw[..len].iter().zip(&unswapped[..len]).position(|(a, b)| a != b);
+            match first_diff {
+                None => println!(
+                    "track {number}: WAV payload matches the raw bytes over {len} bytes (raw {} bytes, wav payload {} bytes) — the writer is innocent; check the Raw file in an external tool",
+                    raw.len(),
+                    payload.len()
+                ),
+                Some(at) => println!(
+                    "track {number}: WAV payload differs from the raw bytes at byte {at} (raw {} bytes, wav payload {} bytes) — the writer or the demux feeding it is implicated",
+                    raw.len(),
+                    payload.len()
+                ),
+            }
+            println!(
+                "track {number}: FLAC saved at {} for comparison by ear or with an external decoder",
+                out.join(format!("track{number:02}_Flac")).join(format!("track{number:02}.flac")).display()
+            );
         }
     }
 }
